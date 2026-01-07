@@ -5,6 +5,14 @@ import { getReasoningSignature, getToolSignature } from '../thoughtSignatureCach
 import { setToolNameMapping } from '../toolNameCache.js';
 import { getThoughtSignatureForModel, getToolSignatureForModel, sanitizeToolName, modelMapping, isEnableThinking, generateGenerationConfig } from '../utils.js';
 
+const SAFETY_SETTINGS_BLOCK_NONE = [
+  { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+  { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+  { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+  { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+  { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
+];
+
 /**
  * 获取签名上下文
  * @param {string} sessionId - 会话 ID
@@ -166,7 +174,8 @@ export function buildRequestBody({ contents, tools, generationConfig, sessionId,
       tools: tools || [],
       toolConfig: { functionCallingConfig: { mode: 'VALIDATED' } },
       generationConfig,
-      sessionId
+      sessionId,
+	  safetySettings: SAFETY_SETTINGS_BLOCK_NONE
     },
     model: actualModelName,
     userAgent: 'antigravity'
