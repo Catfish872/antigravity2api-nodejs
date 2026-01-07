@@ -142,7 +142,7 @@ export function prepareImageRequest(requestBody) {
     }
   };
   requestBody.requestType = 'image_gen';
-  delete requestBody.request.systemInstruction;
+  //delete requestBody.request.systemInstruction;
   delete requestBody.request.tools;
   delete requestBody.request.toolConfig;
   return requestBody;
