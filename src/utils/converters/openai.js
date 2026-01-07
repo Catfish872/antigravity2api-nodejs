@@ -77,7 +77,8 @@ function handleToolCall(message, antigravityMessages) {
 function openaiMessageToAntigravity(openaiMessages, enableThinking, actualModelName, sessionId) {
   const antigravityMessages = [];
   for (const message of openaiMessages) {
-    if (message.role === 'user' || message.role === 'system') {
+    //if (message.role === 'user' || message.role === 'system') {
+	if (message.role === 'user') {
       const extracted = extractImagesFromContent(message.content);
       pushUserMessage(extracted, antigravityMessages);
     } else if (message.role === 'assistant') {

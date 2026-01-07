@@ -174,7 +174,7 @@ export function buildRequestBody({ contents, tools, generationConfig, sessionId,
 
   if (systemInstruction) {
     requestBody.request.systemInstruction = {
-      role: 'user',
+      //role: 'user',
       parts: [{ text: systemInstruction }]
     };
   }
