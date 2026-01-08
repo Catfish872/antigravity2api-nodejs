@@ -342,6 +342,48 @@ export async function getModelsWithQuotas(token) {
 
 export async function generateAssistantResponseNoStream(requestBody, token) {
   
+  // 1. 判别逻辑：是否为 Claude 模型且非生图请求
+  const isClaude = requestBody.model && requestBody.model.toLowerCase().includes('claude');
+  const isImageGen = requestBody.requestType === 'image_gen';
+
+  // ==================== 策略 A：Claude 伪装模式 (Stream -> NoStream) ====================
+  if (isClaude && !isImageGen) {
+    let content = '';
+    let reasoningContent = '';
+    let reasoningSignature = null;
+    let toolCalls = [];
+    let usage = null;
+
+    // 复用已有的流式函数 generateAssistantResponse
+    // 这里的 callback 会被多次调用，我们需要手动把碎片拼接起来
+    await generateAssistantResponse(requestBody, token, (data) => {
+      if (data.type === 'usage') {
+        usage = data.usage;
+      } else if (data.type === 'reasoning') {
+        reasoningContent += (data.reasoning_content || '');
+        // 捕获第一个出现的签名
+        if (data.thoughtSignature && !reasoningSignature) {
+          reasoningSignature = data.thoughtSignature;
+        }
+      } else if (data.type === 'tool_calls') {
+        toolCalls.push(...data.tool_calls);
+      } else if (data.content) {
+        content += data.content;
+      }
+    });
+
+    // 拼装成标准的非流式响应对象返回
+    return { 
+      content, 
+      reasoningContent: reasoningContent || null, 
+      reasoningSignature, 
+      toolCalls, 
+      usage 
+    };
+  }
+
+  // ==================== 策略 B：原生非流式模式 (Gemini/GPT-OSS 等) ====================
+  // (以下为原本的代码逻辑，保持不变)
   const headers = buildHeaders(token);
   let data;
   
@@ -364,7 +406,7 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
   } catch (error) {
     await handleApiError(error, token);
   }
-  //console.log(JSON.stringify(data));
+  
   // 解析响应内容
   const parts = data.response?.candidates?.[0]?.content?.parts || [];
   let content = '';
@@ -375,7 +417,7 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
   
   for (const part of parts) {
     if (part.thought === true) {
-      // 思维链内容 - 使用 DeepSeek 格式的 reasoning_content
+      // 思维链内容
       reasoningContent += part.text || '';
       if (part.thoughtSignature && !reasoningSignature) {
         reasoningSignature = part.thoughtSignature;
@@ -389,35 +431,34 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
       }
       toolCalls.push(toolCall);
     } else if (part.inlineData) {
-      // 保存图片到本地并获取 URL
+      // 保存图片
       const imageUrl = saveBase64Image(part.inlineData.data, part.inlineData.mimeType);
       imageUrls.push(imageUrl);
     }
   }
   
   // 提取 token 使用统计
-  const usage = data.response?.usageMetadata;
-  const usageData = usage ? {
-    prompt_tokens: usage.promptTokenCount || 0,
-    completion_tokens: usage.candidatesTokenCount || 0,
-    total_tokens: usage.totalTokenCount || 0
+  const usageRaw = data.response?.usageMetadata;
+  const usageData = usageRaw ? {
+    prompt_tokens: usageRaw.promptTokenCount || 0,
+    completion_tokens: usageRaw.candidatesTokenCount || 0,
+    total_tokens: usageRaw.totalTokenCount || 0
   } : null;
   
-  // 将新的签名写入全局缓存（按 sessionId + model），供后续请求兜底使用
+  // 缓存签名
   const sessionId = requestBody.request?.sessionId;
   const model = requestBody.model;
   if (sessionId && model) {
     if (reasoningSignature) {
       setReasoningSignature(sessionId, model, reasoningSignature);
     }
-    // 工具签名：取第一个带 thoughtSignature 的工具作为缓存源
     const toolSig = toolCalls.find(tc => tc.thoughtSignature)?.thoughtSignature;
     if (toolSig) {
       setToolSignature(sessionId, model, toolSig);
     }
   }
 
-  // 生图模型：转换为 markdown 格式
+  // 生图模型 markdown 处理
   if (imageUrls.length > 0) {
     let markdown = content ? content + '\n\n' : '';
     markdown += imageUrls.map(url => `![image](${url})`).join('\n\n');
