@@ -347,7 +347,7 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
   const isImageGen = requestBody.requestType === 'image_gen';
 
   // ==================== 策略 A：Claude 伪装模式 (Stream -> NoStream) ====================
-  if (isClaude && !isImageGen) {
+  if (!isImageGen) {
     let content = '';
     let reasoningContent = '';
     let reasoningSignature = null;
