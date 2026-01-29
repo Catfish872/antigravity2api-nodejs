@@ -142,7 +142,7 @@ export function buildConfig(jsonConfig) {
       modelsUrl: jsonConfig.api?.modelsUrl || 'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels',
       noStreamUrl: jsonConfig.api?.noStreamUrl || 'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent',
       host: jsonConfig.api?.host || 'daily-cloudcode-pa.sandbox.googleapis.com',
-      userAgent: jsonConfig.api?.userAgent || 'antigravity/1.11.3 windows/amd64'
+      userAgent: jsonConfig.api?.userAgent || 'antigravity/1.15.8 windows/amd64'
     },
     defaults: {
       temperature: jsonConfig.defaults?.temperature ?? DEFAULT_GENERATION_PARAMS.temperature,
