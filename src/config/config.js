@@ -138,11 +138,11 @@ export function buildConfig(jsonConfig) {
     imageBaseUrl: process.env.IMAGE_BASE_URL || null,
     maxImages: jsonConfig.other?.maxImages || DEFAULT_MAX_IMAGES,
     api: {
-      url: jsonConfig.api?.url || 'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse',
-      modelsUrl: jsonConfig.api?.modelsUrl || 'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels',
-      noStreamUrl: jsonConfig.api?.noStreamUrl || 'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent',
-      host: jsonConfig.api?.host || 'daily-cloudcode-pa.sandbox.googleapis.com',
-      userAgent: jsonConfig.api?.userAgent || 'antigravity/1.13.3 windows/amd64'
+      url: jsonConfig.api?.url || 'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse',
+      modelsUrl: jsonConfig.api?.modelsUrl || 'https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
+      noStreamUrl: jsonConfig.api?.noStreamUrl || 'https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent',
+      host: jsonConfig.api?.host || 'daily-cloudcode-pa.googleapis.com',
+      userAgent: jsonConfig.api?.userAgent || 'antigravity/1.13.3 windows/amd64' // 关键修改：版本号升级到 1.13.3
     },
     defaults: {
       temperature: jsonConfig.defaults?.temperature ?? DEFAULT_GENERATION_PARAMS.temperature,
