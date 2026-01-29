@@ -15,7 +15,7 @@
     "modelsUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
     "noStreamUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent",
     "host": "daily-cloudcode-pa.sandbox.googleapis.com",
-    "userAgent": "antigravity/1.11.3 windows/amd64"
+    "userAgent": "antigravity/1.15.8 windows/amd64"
   },
   "defaults": {
     "temperature": 1,
