@@ -133,12 +133,16 @@ export const with429Retry = async (fn, maxRetries, loggerPrefix = '') => {
     } catch (error) {
       // 兼容多种错误格式：error.status, error.statusCode, error.response?.status
       const status = Number(error.status || error.statusCode || error.response?.status);
-      if (status === 429 && attempt < retries) {
+      
+      if ((status === 429 || status === 503) && attempt < retries) {
         const nextAttempt = attempt + 1;
-        logger.warn(`${loggerPrefix}收到 429，正在进行第 ${nextAttempt} 次重试（共 ${retries} 次）`);
+        // 修改日志：打印具体的错误码 (status)
+        logger.warn(`${loggerPrefix}收到 ${status}，正在进行第 ${nextAttempt} 次重试（共 ${retries} 次）`);
         attempt = nextAttempt;
         continue;
       }
+      // modifications end here
+      
       throw error;
     }
   }
