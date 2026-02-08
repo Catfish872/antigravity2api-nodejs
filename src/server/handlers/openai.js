@@ -53,18 +53,10 @@ export const handleOpenAIRequest = async (req, res) => {
     if (!messages) {
       return res.status(400).json({ error: 'messages is required' });
     }
-    
-    const token = await tokenManager.getToken();
-    if (!token) {
-      throw new Error('没有可用的token，请运行 npm run login 获取token');
-    }
-    
+
+    // [修改修正] 只需要保留这一行判断，移除原来所有的 getToken 和 requestBody 生成代码
     const isImageModel = model.includes('-image');
-    const requestBody = generateRequestBody(messages, model, params, tools, token);
-    
-    if (isImageModel) {
-      prepareImageRequest(requestBody);
-    }
+
     //console.log(JSON.stringify(requestBody,null,2));
     const { id, created } = createResponseMeta();
     const maxRetries = Number(config.retryTimes || 0);
@@ -79,7 +71,13 @@ export const handleOpenAIRequest = async (req, res) => {
       try {
         if (isImageModel) {
           const { content, usage } = await with429Retry(
-            () => generateAssistantResponseNoStream(requestBody, token),
+            async () => {
+              const token = await tokenManager.getToken();
+              if (!token) throw { status: 500, message: 'No available token' };
+              const requestBody = generateRequestBody(messages, model, params, tools, token);
+              prepareImageRequest(requestBody);
+              return generateAssistantResponseNoStream(requestBody, token);
+            },
             safeRetries,
             'chat.stream.image '
           );
@@ -90,33 +88,47 @@ export const handleOpenAIRequest = async (req, res) => {
           let usageData = null;
 
           await with429Retry(
-            () => generateAssistantResponse(requestBody, token, (data) => {
-              if (data.type === 'usage') {
-                usageData = data.usage;
-              } else if (data.type === 'reasoning') {
-                const delta = { reasoning_content: data.reasoning_content };
-                if (data.thoughtSignature && config.passSignatureToClient) {
-                  delta.thoughtSignature = data.thoughtSignature;
+            async () => {
+              const token = await tokenManager.getToken();
+              if (!token) throw { status: 500, message: 'No available token' };
+              const requestBody = generateRequestBody(messages, model, params, tools, token);
+              
+              let hasContent = false;
+              await generateAssistantResponse(requestBody, token, (data) => {
+                if (data.content && data.content.length > 0) {
+                  hasContent = true;
                 }
-                writeStreamData(res, createStreamChunk(id, created, model, delta));
-              } else if (data.type === 'tool_calls') {
-                hasToolCall = true;
-                // 根据配置决定是否透传工具调用中的签名
-                const toolCallsWithIndex = data.tool_calls.map((toolCall, index) => {
-                  if (config.passSignatureToClient) {
-                    return { index, ...toolCall };
-                  } else {
-                    const { thoughtSignature, ...rest } = toolCall;
-                    return { index, ...rest };
+
+                if (data.type === 'usage') {
+                  usageData = data.usage;
+                } else if (data.type === 'reasoning') {
+                  const delta = { reasoning_content: data.reasoning_content };
+                  if (data.thoughtSignature && config.passSignatureToClient) {
+                    delta.thoughtSignature = data.thoughtSignature;
                   }
-                });
-                const delta = { tool_calls: toolCallsWithIndex };
-                writeStreamData(res, createStreamChunk(id, created, model, delta));
-              } else {
-                const delta = { content: data.content };
-                writeStreamData(res, createStreamChunk(id, created, model, delta));
+                  writeStreamData(res, createStreamChunk(id, created, model, delta));
+                } else if (data.type === 'tool_calls') {
+                  hasToolCall = true;
+                  const toolCallsWithIndex = data.tool_calls.map((toolCall, index) => {
+                    if (config.passSignatureToClient) {
+                      return { index, ...toolCall };
+                    } else {
+                      const { thoughtSignature, ...rest } = toolCall;
+                      return { index, ...rest };
+                    }
+                  });
+                  const delta = { tool_calls: toolCallsWithIndex };
+                  writeStreamData(res, createStreamChunk(id, created, model, delta));
+                } else {
+                  const delta = { content: data.content };
+                  writeStreamData(res, createStreamChunk(id, created, model, delta));
+                }
+              });
+
+              if (!hasContent && !hasToolCall) {
+                throw { status: 503, message: 'Empty Stream Response' };
               }
-            }),
+            },
             safeRetries,
             'chat.stream '
           );
@@ -136,7 +148,13 @@ export const handleOpenAIRequest = async (req, res) => {
       res.setTimeout(0); // 禁用响应超时
       
       const { content, reasoningContent, reasoningSignature, toolCalls, usage } = await with429Retry(
-        () => generateAssistantResponseNoStream(requestBody, token),
+        async () => {
+          const token = await tokenManager.getToken();
+          if (!token) throw { status: 500, message: 'No available token' };
+          const requestBody = generateRequestBody(messages, model, params, tools, token);
+          if (isImageModel) prepareImageRequest(requestBody);
+          return generateAssistantResponseNoStream(requestBody, token);
+        },
         safeRetries,
         'chat.no_stream '
       );
