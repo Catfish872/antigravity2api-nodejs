@@ -137,7 +137,11 @@ export const with429Retry = async (fn, maxRetries, loggerPrefix = '') => {
       if ((status === 429 || status === 503) && attempt < retries) {
         const nextAttempt = attempt + 1;
         // 修改日志：打印具体的错误码 (status)
-        logger.warn(`${loggerPrefix}收到 ${status}，正在进行第 ${nextAttempt} 次重试（共 ${retries} 次）`);
+        const tokenInfo = (error.tokenIndex !== undefined && error.tokenIndex !== null) ? ` [Token Index: ${error.tokenIndex}]` : '';
+        logger.warn(`${loggerPrefix}收到 ${status}${tokenInfo}，0.5秒后正在进行第 ${nextAttempt} 次重试（共 ${retries} 次）`);
+        
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
         attempt = nextAttempt;
         continue;
       }
