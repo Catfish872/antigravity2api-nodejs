@@ -54,7 +54,7 @@ export const handleOpenAIRequest = async (req, res) => {
       return res.status(400).json({ error: 'messages is required' });
     }
 
-    // [修改修正] 只需要保留这一行判断，移除原来所有的 getToken 和 requestBody 生成代码
+    // 判别逻辑：是否为生图模型
     const isImageModel = model.includes('-image');
 
     //console.log(JSON.stringify(requestBody,null,2));
@@ -74,9 +74,20 @@ export const handleOpenAIRequest = async (req, res) => {
             async () => {
               const token = await tokenManager.getToken();
               if (!token) throw { status: 500, message: 'No available token' };
-              const requestBody = generateRequestBody(messages, model, params, tools, token);
-              prepareImageRequest(requestBody);
-              return generateAssistantResponseNoStream(requestBody, token);
+              try {
+                const requestBody = generateRequestBody(messages, model, params, tools, token);
+                prepareImageRequest(requestBody);
+                return await generateAssistantResponseNoStream(requestBody, token);
+              } catch (err) {
+                const tokenIndex = tokenManager.tokens.indexOf(token);
+                if (tokenIndex !== -1) err.tokenIndex = tokenIndex;
+                
+                // 生图空回不重试，返回空结果
+                if (err.message && err.message.includes('Empty')) {
+                  return { content: '', usage: null };
+                }
+                throw err;
+              }
             },
             safeRetries,
             'chat.stream.image '
@@ -91,42 +102,49 @@ export const handleOpenAIRequest = async (req, res) => {
             async () => {
               const token = await tokenManager.getToken();
               if (!token) throw { status: 500, message: 'No available token' };
-              const requestBody = generateRequestBody(messages, model, params, tools, token);
               
-              let hasContent = false;
-              await generateAssistantResponse(requestBody, token, (data) => {
-                if (data.content && data.content.length > 0) {
-                  hasContent = true;
-                }
-
-                if (data.type === 'usage') {
-                  usageData = data.usage;
-                } else if (data.type === 'reasoning') {
-                  const delta = { reasoning_content: data.reasoning_content };
-                  if (data.thoughtSignature && config.passSignatureToClient) {
-                    delta.thoughtSignature = data.thoughtSignature;
+              try {
+                const requestBody = generateRequestBody(messages, model, params, tools, token);
+                
+                let hasContent = false;
+                await generateAssistantResponse(requestBody, token, (data) => {
+                  if (data.content && data.content.length > 0) {
+                    hasContent = true;
                   }
-                  writeStreamData(res, createStreamChunk(id, created, model, delta));
-                } else if (data.type === 'tool_calls') {
-                  hasToolCall = true;
-                  const toolCallsWithIndex = data.tool_calls.map((toolCall, index) => {
-                    if (config.passSignatureToClient) {
-                      return { index, ...toolCall };
-                    } else {
-                      const { thoughtSignature, ...rest } = toolCall;
-                      return { index, ...rest };
-                    }
-                  });
-                  const delta = { tool_calls: toolCallsWithIndex };
-                  writeStreamData(res, createStreamChunk(id, created, model, delta));
-                } else {
-                  const delta = { content: data.content };
-                  writeStreamData(res, createStreamChunk(id, created, model, delta));
-                }
-              });
 
-              if (!hasContent && !hasToolCall) {
-                throw { status: 503, message: 'Empty Stream Response' };
+                  if (data.type === 'usage') {
+                    usageData = data.usage;
+                  } else if (data.type === 'reasoning') {
+                    const delta = { reasoning_content: data.reasoning_content };
+                    if (data.thoughtSignature && config.passSignatureToClient) {
+                      delta.thoughtSignature = data.thoughtSignature;
+                    }
+                    writeStreamData(res, createStreamChunk(id, created, model, delta));
+                  } else if (data.type === 'tool_calls') {
+                    hasToolCall = true;
+                    const toolCallsWithIndex = data.tool_calls.map((toolCall, index) => {
+                      if (config.passSignatureToClient) {
+                        return { index, ...toolCall };
+                      } else {
+                        const { thoughtSignature, ...rest } = toolCall;
+                        return { index, ...rest };
+                      }
+                    });
+                    const delta = { tool_calls: toolCallsWithIndex };
+                    writeStreamData(res, createStreamChunk(id, created, model, delta));
+                  } else {
+                    const delta = { content: data.content };
+                    writeStreamData(res, createStreamChunk(id, created, model, delta));
+                  }
+                });
+
+                if (!hasContent && !hasToolCall) {
+                  throw { status: 503, message: 'Empty Stream Response' };
+                }
+              } catch (err) {
+                const tokenIndex = tokenManager.tokens.indexOf(token);
+                if (tokenIndex !== -1) err.tokenIndex = tokenIndex;
+                throw err;
               }
             },
             safeRetries,
@@ -151,9 +169,21 @@ export const handleOpenAIRequest = async (req, res) => {
         async () => {
           const token = await tokenManager.getToken();
           if (!token) throw { status: 500, message: 'No available token' };
-          const requestBody = generateRequestBody(messages, model, params, tools, token);
-          if (isImageModel) prepareImageRequest(requestBody);
-          return generateAssistantResponseNoStream(requestBody, token);
+          
+          try {
+            const requestBody = generateRequestBody(messages, model, params, tools, token);
+            if (isImageModel) prepareImageRequest(requestBody);
+            return await generateAssistantResponseNoStream(requestBody, token);
+          } catch (err) {
+            const tokenIndex = tokenManager.tokens.indexOf(token);
+            if (tokenIndex !== -1) err.tokenIndex = tokenIndex;
+            
+            // 生图空回不重试，返回空结果
+            if (isImageModel && err.message && err.message.includes('Empty')) {
+              return { content: '', reasoningContent: null, reasoningSignature: null, toolCalls: [], usage: null };
+            }
+            throw err;
+          }
         },
         safeRetries,
         'chat.no_stream '
