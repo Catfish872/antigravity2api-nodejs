@@ -1,397 +1,327 @@
 import { spawn } from 'child_process';
-import os from 'os';
-import path from 'path';
+import { existsSync, chmodSync } from 'fs';
+import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import fs from 'fs';
+import { platform, arch } from 'os';
+import zlib from 'zlib';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// 检测是否在 pkg 打包环境中运行
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const isPkg = typeof process.pkg !== 'undefined';
 
-// 缓冲区大小警告阈值（不限制，只警告）
-const BUFFER_WARNING_SIZE = 50 * 1024 * 1024; // 50MB 警告
+// ==================== 辅助函数 ====================
+function decompressGzip(buffer) {
+  return new Promise((resolve, reject) => {
+    zlib.gunzip(buffer, (err, result) => {
+      if (err) reject(err);
+      else resolve(result);
+    });
+  });
+}
 
-class antigravityRequester {
-    constructor(options = {}) {
-        this.binPath = options.binPath;
-        this.executablePath = options.executablePath || this._getExecutablePath();
-        this.proc = null;
-        this.requestId = 0;
-        this.pendingRequests = new Map();
-        this.buffer = '';
-        this.writeQueue = Promise.resolve();
-        this.bufferWarned = false;
+// ==================== 新版核心逻辑 (源自 liuw1535) ====================
+class FingerprintRequester {
+  constructor(options = {}) {
+    this.binDir = options.binPath || this._detectBinDir();
+    this.binaryPath = options.executablePath || this._detectBinary();
+    // 自动指向 bin 目录下的 tls_config.json
+    this.configPath = join(this.binDir, 'tls_config.json'); 
+    this.defaults = {
+      timeout: 30,
+      proxy: null,
+    };
+    this.activeProcesses = new Set();
+  }
+
+  _detectBinDir() {
+    if (isPkg) {
+      const exeDir = dirname(process.execPath);
+      const exeBinDir = join(exeDir, 'bin');
+      if (existsSync(exeBinDir)) return exeBinDir;
+      const cwdBinDir = join(process.cwd(), 'bin');
+      if (existsSync(cwdBinDir)) return cwdBinDir;
+    }
+    return join(__dirname, 'bin');
+  }
+
+  _detectBinary() {
+    const platformMap = { win32: 'windows', linux: 'linux', android: 'android', darwin: 'linux' };
+    const archMap = { x64: 'amd64', arm64: 'arm64' };
+    const os = platformMap[platform()];
+    const cpuArch = archMap[arch()];
+
+    if (!os || !cpuArch) throw new Error(`Unsupported platform: ${platform()} ${arch()}`);
+
+    const ext = platform() === 'win32' ? '.exe' : '';
+    // 注意：这里指向新的二进制文件名
+    const binaryName = `fingerprint_${os}_${cpuArch}${ext}`;
+    const binaryPath = join(this.binDir, binaryName);
+
+    if (!existsSync(binaryPath)) {
+        // 尝试回退查找（防止有些环境只拷贝了文件没改结构）
+        console.warn(`Binary not found at ${binaryPath}, checking fallback...`);
     }
 
-    _getExecutablePath() {
-        const platform = os.platform();
-        const arch = os.arch();
-        
-        let filename;
-        if (platform === 'win32' && arch === "x64") {
-            filename = 'antigravity_requester_windows_amd64.exe';
-        } else if (platform === 'android' && arch === "arm64") {
-            filename = 'antigravity_requester_android_arm64';
-        } else if (platform === 'linux' && arch === "x64") {
-            filename = 'antigravity_requester_linux_amd64';
-        } else if (platform === 'linux' && arch === "arm64") {
-            // Linux ARM64 (Termux, Raspberry Pi, etc.)
-            filename = 'antigravity_requester_android_arm64';
+    if (platform() !== 'win32') {
+      try { chmodSync(binaryPath, 0o755); } catch (e) {}
+    }
+    return binaryPath;
+  }
+
+  async request(config) {
+    const {
+      method = 'GET', url, headers = {}, data = '',
+      timeout, proxy, responseType = 'text',
+      onDownloadProgress, validateStatus = (status) => status >= 200 && status < 300,
+      signal, skipGzipDecompress = false,
+    } = config;
+
+    const requestPayload = {
+      method: method.toUpperCase(),
+      url, headers,
+      body: typeof data === 'string' ? data : JSON.stringify(data),
+      config_path: this.configPath, // 传递 tls_config.json 路径
+    };
+
+    const timeoutSec = timeout || this.defaults.timeout;
+    if (timeoutSec) requestPayload.timeout = { connect: timeoutSec, read: timeoutSec };
+
+    const proxyUrl = proxy || this.defaults.proxy;
+    if (proxyUrl) {
+      const proxyType = proxyUrl.startsWith('socks') ? 'socks5' : 'http';
+      requestPayload.proxy = { enabled: true, type: proxyType, url: proxyUrl };
+    }
+
+    return new Promise((resolve, reject) => {
+      const proc = spawn(this.binaryPath);
+      this.activeProcesses.add(proc);
+      
+      let headersParsed = false;
+      let responseHeaders = {};
+      let responseStatus = 200;
+      let responseStatusText = 'OK';
+      let headerBuffer = null;
+      let bodyChunks = [];
+      let totalLoaded = 0;
+      let stderrData = '';
+
+      const timeoutId = setTimeout(() => {
+        proc.kill();
+        reject(new Error('Request timeout'));
+      }, timeoutSec * 1000);
+
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          proc.kill();
+          reject(new Error('Request aborted'));
+        });
+      }
+
+      proc.stdout.on('data', (chunk) => {
+        if (!headersParsed) {
+          if (!headerBuffer) headerBuffer = chunk;
+          else headerBuffer = Buffer.concat([headerBuffer, chunk]);
+
+          const separator = Buffer.from('\r\n\r\n');
+          const headerEndIndex = headerBuffer.indexOf(separator);
+
+          if (headerEndIndex !== -1) {
+            const headerPart = headerBuffer.slice(0, headerEndIndex).toString('utf8');
+            const bodyPart = headerBuffer.slice(headerEndIndex + 4);
+
+            const lines = headerPart.split('\r\n');
+            const statusMatch = lines[0].match(/HTTP\/[\d.]+ (\d+) (.+)/);
+            responseStatus = statusMatch ? parseInt(statusMatch[1]) : 200;
+            responseStatusText = statusMatch ? statusMatch[2] : 'OK';
+
+            for (let i = 1; i < lines.length; i++) {
+              const [key, ...valueParts] = lines[i].split(': ');
+              if (key) responseHeaders[key.toLowerCase()] = valueParts.join(': ');
+            }
+
+            headersParsed = true;
+            headerBuffer = null;
+            clearTimeout(timeoutId);
+
+            if (bodyPart.length > 0) {
+              bodyChunks.push(bodyPart);
+              totalLoaded += bodyPart.length;
+              if (onDownloadProgress) {
+                onDownloadProgress({
+                  loaded: totalLoaded,
+                  total: parseInt(responseHeaders['content-length']) || 0,
+                  chunk: bodyPart.toString('utf8'),
+                  status: responseStatus,
+                  headers: responseHeaders,
+                });
+              }
+            }
+          }
         } else {
-            throw new Error(`Unsupported platform: ${platform}+${arch}`);
-        }
-        
-        // 获取 bin 目录路径
-        // pkg 环境下优先使用可执行文件旁边的 bin 目录
-        let binPath = this.binPath;
-        if (!binPath) {
-            if (isPkg) {
-                // pkg 环境：优先使用可执行文件旁边的 bin 目录
-                const exeDir = path.dirname(process.execPath);
-                const exeBinDir = path.join(exeDir, 'bin');
-                if (fs.existsSync(exeBinDir)) {
-                    binPath = exeBinDir;
-                } else {
-                    // 其次使用当前工作目录的 bin 目录
-                    const cwdBinDir = path.join(process.cwd(), 'bin');
-                    if (fs.existsSync(cwdBinDir)) {
-                        binPath = cwdBinDir;
-                    } else {
-                        // 最后使用打包内的 bin 目录
-                        binPath = path.join(__dirname, 'bin');
-                    }
-                }
-            } else {
-                // 开发环境
-                binPath = path.join(__dirname, 'bin');
-            }
-        }
-        
-        const requester_execPath = path.join(binPath, filename);
-        
-        // 检查文件是否存在
-        if (!fs.existsSync(requester_execPath)) {
-            console.warn(`Binary not found at: ${requester_execPath}`);
-        }
-        
-        // 设置执行权限（非Windows平台）
-        if (platform !== 'win32') {
-            try {
-                fs.chmodSync(requester_execPath, 0o755);
-            } catch (error) {
-                console.warn(`Could not set executable permissions: ${error.message}`);
-            }
-        }
-        return requester_execPath;
-    }
-
-    _ensureProcess() {
-        if (this.proc) return;
-
-        this.proc = spawn(this.executablePath, [], {
-            stdio: ['pipe', 'pipe', 'pipe']
-        });
-
-        // 设置 stdin 为非阻塞模式
-        if (this.proc.stdin.setDefaultEncoding) {
-            this.proc.stdin.setDefaultEncoding('utf8');
-        }
-
-        // 增大 stdout 缓冲区以减少背压
-        if (this.proc.stdout.setEncoding) {
-            this.proc.stdout.setEncoding('utf8');
-        }
-        
-        // 使用 setImmediate 异步处理数据,避免阻塞
-        this.proc.stdout.on('data', (data) => {
-            const chunk = data.toString();
-            
-            // 缓冲区大小监控（仅警告，不限制，因为图片响应可能很大）
-            if (!this.bufferWarned && this.buffer.length > BUFFER_WARNING_SIZE) {
-                console.warn(`AntigravityRequester: 缓冲区较大 (${Math.round(this.buffer.length / 1024 / 1024)}MB)，可能有大型响应`);
-                this.bufferWarned = true;
-            }
-            
-            this.buffer += chunk;
-            
-            // 使用 setImmediate 异步处理,避免阻塞 stdout 读取
-            setImmediate(() => {
-                let start = 0;
-                let end;
-                
-                // 高效的行分割（避免 split 创建大量字符串）
-                while ((end = this.buffer.indexOf('\n', start)) !== -1) {
-                    const line = this.buffer.slice(start, end).trim();
-                    start = end + 1;
-                    
-                    if (!line) continue;
-                    
-                    try {
-                        const response = JSON.parse(line);
-                        const pending = this.pendingRequests.get(response.id);
-                        if (!pending) continue;
-
-                        if (pending.streamResponse) {
-                            pending.streamResponse._handleChunk(response);
-                            if (response.type === 'end' || response.type === 'error') {
-                                this.pendingRequests.delete(response.id);
-                            }
-                        } else {
-                            this.pendingRequests.delete(response.id);
-                            if (response.ok) {
-                                pending.resolve(new antigravityResponse(response));
-                            } else {
-                                pending.reject(new Error(response.error || 'Request failed'));
-                            }
-                        }
-                    } catch (e) {
-                        // 忽略 JSON 解析错误（可能是不完整的行）
-                    }
-                }
-                
-                // 保留未处理的部分
-                this.buffer = start < this.buffer.length ? this.buffer.slice(start) : '';
-                this.bufferWarned = false;
+          bodyChunks.push(chunk);
+          totalLoaded += chunk.length;
+          if (onDownloadProgress) {
+            onDownloadProgress({
+              loaded: totalLoaded,
+              total: parseInt(responseHeaders['content-length']) || 0,
+              chunk: chunk.toString('utf8'),
+              status: responseStatus,
+              headers: responseHeaders,
             });
-        });
-
-        this.proc.stderr.on('data', (data) => {
-            console.error('antigravityRequester stderr:', data.toString());
-        });
-
-        this.proc.on('close', () => {
-            this.proc = null;
-            for (const [id, pending] of this.pendingRequests) {
-                if (pending.reject) {
-                    pending.reject(new Error('Process closed'));
-                } else if (pending.streamResponse && pending.streamResponse._onError) {
-                    pending.streamResponse._onError(new Error('Process closed'));
-                }
-            }
-            this.pendingRequests.clear();
-        });
-    }
-
-    async antigravity_fetch(url, options = {}) {
-        this._ensureProcess();
-
-        const id = `req-${++this.requestId}`;
-        const request = {
-            id,
-            url,
-            method: options.method || 'GET',
-            headers: options.headers,
-            body: options.body,
-            timeout_ms: options.timeout || 30000,
-            proxy: options.proxy,
-            response_format: 'text',
-            ...options
-        };
-
-        return new Promise((resolve, reject) => {
-            this.pendingRequests.set(id, { resolve, reject });
-            this._writeRequest(request);
-        });
-    }
-
-    antigravity_fetchStream(url, options = {}) {
-        this._ensureProcess();
-
-        const id = `req-${++this.requestId}`;
-        const request = {
-            id,
-            url,
-            method: options.method || 'GET',
-            headers: options.headers,
-            body: options.body,
-            timeout_ms: options.timeout || 30000,
-            proxy: options.proxy,
-            stream: true,
-            ...options
-        };
-
-        const streamResponse = new StreamResponse(id);
-        this.pendingRequests.set(id, { streamResponse });
-        this._writeRequest(request);
-        
-        return streamResponse;
-    }
-
-    _writeRequest(request) {
-        this.writeQueue = this.writeQueue.then(() => {
-            return new Promise((resolve, reject) => {
-                const data = JSON.stringify(request) + '\n';
-                const canWrite = this.proc.stdin.write(data);
-                if (canWrite) {
-                    resolve();
-                } else {
-                    // 等待 drain 事件，并在任一事件触发后移除另一个监听器
-                    const onDrain = () => {
-                        this.proc.stdin.removeListener('error', onError);
-                        resolve();
-                    };
-                    const onError = (err) => {
-                        this.proc.stdin.removeListener('drain', onDrain);
-                        reject(err);
-                    };
-                    this.proc.stdin.once('drain', onDrain);
-                    this.proc.stdin.once('error', onError);
-                }
-            });
-        }).catch(err => {
-            console.error('Write request failed:', err);
-        });
-    }
-
-    close() {
-        if (this.proc) {
-            // 先拒绝所有待处理的请求
-            for (const [id, pending] of this.pendingRequests) {
-                if (pending.reject) {
-                    pending.reject(new Error('Requester closed'));
-                } else if (pending.streamResponse && pending.streamResponse._onError) {
-                    pending.streamResponse._onError(new Error('Requester closed'));
-                }
-            }
-            this.pendingRequests.clear();
-            
-            // 清理缓冲区
-            this.buffer = '';
-            
-            const proc = this.proc;
-            this.proc = null;
-            
-            // 关闭输入流
-            try {
-                proc.stdin.end();
-            } catch (e) {
-                // 忽略关闭错误
-            }
-            
-            // 立即发送 SIGTERM 终止子进程，不使用 setTimeout
-            // 这样可以确保在主进程退出前子进程被正确终止
-            try {
-                if (proc && !proc.killed) {
-                    proc.kill('SIGTERM');
-                }
-            } catch (e) {
-                // 忽略错误
-            }
-            
-            // 如果 SIGTERM 无效，立即使用 SIGKILL
-            try {
-                if (proc && !proc.killed) {
-                    proc.kill('SIGKILL');
-                }
-            } catch (e) {
-                // 忽略错误
-            }
+          }
         }
-    }
+      });
+
+      proc.stderr.on('data', (data) => stderrData += data.toString());
+
+      proc.on('close', async (code) => {
+        clearTimeout(timeoutId);
+        this.activeProcesses.delete(proc);
+        if (code !== 0) {
+             // 简单的错误处理
+             return reject(new Error(stderrData || `Process exited with code ${code}`));
+        }
+
+        try {
+          let bodyBuffer = Buffer.concat(bodyChunks);
+          const contentEncoding = responseHeaders['content-encoding'] || '';
+          const isGzipData = bodyBuffer.length >= 2 && bodyBuffer[0] === 0x1f && bodyBuffer[1] === 0x8b;
+          
+          if (!skipGzipDecompress && contentEncoding.toLowerCase().includes('gzip') && isGzipData) {
+            bodyBuffer = await decompressGzip(bodyBuffer);
+          }
+
+          const body = bodyBuffer.toString('utf8');
+          let parsedData = body;
+          if (responseType === 'json') {
+             try { parsedData = JSON.parse(body); } catch(e) {}
+          }
+
+          const response = {
+            data: parsedData,
+            status: responseStatus,
+            statusText: responseStatusText,
+            headers: responseHeaders,
+            config,
+          };
+          
+          if (!validateStatus(responseStatus)) {
+             const err = new Error(`Request failed with status code ${responseStatus}`);
+             err.response = response;
+             return reject(err);
+          }
+          resolve(response);
+        } catch (err) {
+          reject(err);
+        }
+      });
+      
+      proc.stdin.write(JSON.stringify(requestPayload));
+      proc.stdin.end();
+    });
+  }
+
+  // ==================== 兼容旧版 AntigravityRequester 的接口 ====================
+
+  async antigravity_fetch(url, options = {}) {
+    const config = {
+      method: options.method || 'GET',
+      url,
+      headers: options.headers || {},
+      data: options.body || '',
+      timeout: options.timeout_ms ? Math.ceil(options.timeout_ms / 1000) : 30,
+      proxy: options.proxy,
+      skipGzipDecompress: false,
+    };
+
+    const response = await this.request(config);
+    
+    return {
+      ok: response.status >= 200 && response.status < 300,
+      status: response.status,
+      statusText: response.statusText,
+      headers: new Map(Object.entries(response.headers)),
+      url,
+      redirected: false,
+      _data: response.data,
+      async text() {
+        return typeof this._data === 'string' ? this._data : JSON.stringify(this._data);
+      },
+      async json() {
+        return typeof this._data === 'string' ? JSON.parse(this._data) : this._data;
+      },
+      async buffer() {
+        return Buffer.from(typeof this._data === 'string' ? this._data : JSON.stringify(this._data), 'utf8');
+      }
+    };
+  }
+
+  antigravity_fetchStream(url, options = {}) {
+    const streamResponse = new StreamResponse();
+    const config = {
+      method: options.method || 'GET',
+      url,
+      headers: options.headers || {},
+      data: options.body || '',
+      timeout: options.timeout_ms ? Math.ceil(options.timeout_ms / 1000) : 30,
+      proxy: options.proxy,
+      skipGzipDecompress: true, // 流式响应通常由上层处理解压或直接转发
+      onDownloadProgress: ({ chunk, status, headers }) => {
+        if (!streamResponse._started) {
+          streamResponse._started = true;
+          streamResponse.status = status;
+          if (headers) streamResponse.headers = new Map(Object.entries(headers));
+          if (streamResponse._onStart) streamResponse._onStart({ status, headers: streamResponse.headers });
+        }
+        if (streamResponse._onData) streamResponse._onData(chunk);
+        streamResponse.chunks.push(chunk);
+      },
+      validateStatus: (status) => {
+        streamResponse.status = status;
+        return true; 
+      },
+    };
+
+    this.request(config)
+      .then((response) => {
+        streamResponse.headers = new Map(Object.entries(response.headers));
+        streamResponse._ended = true;
+        streamResponse._finalText = streamResponse.chunks.join('');
+        if (streamResponse._onEnd) streamResponse._onEnd();
+      })
+      .catch((error) => {
+        streamResponse._ended = true;
+        streamResponse._error = error;
+        if (streamResponse._onError) streamResponse._onError(error);
+      });
+
+    return streamResponse;
+  }
+
+  close() {
+    this.activeProcesses.forEach(proc => proc.kill());
+    this.activeProcesses.clear();
+  }
 }
 
+// ==================== 辅助类：流式响应 ====================
 class StreamResponse {
-    constructor(id) {
-        this.id = id;
-        this.status = null;
-        this.statusText = null;
-        this.headers = null;
-        this.chunks = [];
-        this._onStart = null;
-        this._onData = null;
-        this._onEnd = null;
-        this._onError = null;
-        this._ended = false;
-        this._error = null;
-        this._textPromiseResolve = null;
-        this._textPromiseReject = null;
-    }
-
-    _handleChunk(chunk) {
-        if (chunk.type === 'start') {
-            this.status = chunk.status;
-            this.headers = new Map(Object.entries(chunk.headers || {}));
-            if (this._onStart) this._onStart({ status: chunk.status, headers: this.headers });
-        } else if (chunk.type === 'data') {
-            const data = chunk.encoding === 'base64' 
-                ? Buffer.from(chunk.data, 'base64').toString('utf8')
-                : chunk.data;
-            this.chunks.push(data);
-            if (this._onData) this._onData(data);
-        } else if (chunk.type === 'end') {
-            this._ended = true;
-            if (this._textPromiseResolve) this._textPromiseResolve(this.chunks.join(''));
-            if (this._onEnd) this._onEnd();
-        } else if (chunk.type === 'error') {
-            this._ended = true;
-            this._error = new Error(chunk.error);
-            if (this._textPromiseReject) this._textPromiseReject(this._error);
-            if (this._onError) this._onError(this._error);
-        }
-    }
-
-    onStart(callback) {
-        this._onStart = callback;
-        return this;
-    }
-
-    onData(callback) {
-        this._onData = callback;
-        return this;
-    }
-
-    onEnd(callback) {
-        this._onEnd = callback;
-        return this;
-    }
-
-    onError(callback) {
-        this._onError = callback;
-        return this;
-    }
-
-    async text() {
-        if (this._ended) {
-            if (this._error) throw this._error;
-            return this.chunks.join('');
-        }
-        return new Promise((resolve, reject) => {
-            this._textPromiseResolve = resolve;
-            this._textPromiseReject = reject;
-        });
-    }
+  constructor() {
+    this.status = null;
+    this.headers = new Map();
+    this.chunks = [];
+    this._onStart = null;
+    this._onData = null;
+    this._onEnd = null;
+    this._onError = null;
+    this._ended = false;
+    this._error = null;
+    this._started = false;
+  }
+  onStart(cb) { this._onStart = cb; return this; }
+  onData(cb) { this._onData = cb; return this; }
+  onEnd(cb) { this._onEnd = cb; return this; }
+  onError(cb) { this._onError = cb; return this; }
 }
 
-class antigravityResponse {
-    constructor(response) {
-        this._response = response;
-        this.ok = response.ok;
-        this.status = response.status;
-        this.statusText = response.status_text;
-        this.url = response.url;
-        this.headers = new Map(Object.entries(response.headers || {}));
-        this.redirected = response.redirected;
-    }
-
-    async text() {
-        if (this._response.body_encoding === 'base64') {
-            return Buffer.from(this._response.body, 'base64').toString('utf8');
-        }
-        return this._response.body;
-    }
-
-    async json() {
-        const text = await this.text();
-        return JSON.parse(text);
-    }
-
-    async buffer() {
-        if (this._response.body_encoding === 'base64') {
-            return Buffer.from(this._response.body, 'base64');
-        }
-        return Buffer.from(this._response.body, 'utf8');
-    }
-}
-
-export default antigravityRequester;
+// 默认导出该类，保持与旧版 client.js 的兼容性
+export default FingerprintRequester;
